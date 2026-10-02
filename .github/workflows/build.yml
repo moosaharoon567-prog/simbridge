@@ -1,0 +1,26 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Arrange folders
+        run: |
+          mkdir -p src/main/java
+          mv AndroidManifest.xml src/main/AndroidManifest.xml
+          mv App.kt src/main/java/App.kt
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simbridge-apk
+          path: build/outputs/apk/debug/*.apk
