@@ -7,6 +7,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadsetClient
+import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -327,6 +331,73 @@ object ClientState {
     @Volatile var number = ""
     @Volatile var name = ""
     val sms = CopyOnWriteArrayList<String>()
+    @Volatile var btStatus = "Not connected"
+}
+
+object BluetoothAudioRelay {
+    @Volatile private var headsetClient: BluetoothHeadsetClient? = null
+    @Volatile private var a07Device: BluetoothDevice? = null
+    private var profileListener: BluetoothProfile.ServiceListener? = null
+
+    fun init(c: Context, a07Mac: String) {
+        try {
+            val ba = BluetoothAdapter.getDefaultAdapter() ?: return
+            a07Device = ba.getRemoteDevice(a07Mac)
+            
+            profileListener = object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    if (profile == BluetoothProfile.HEADSET_CLIENT) {
+                        headsetClient = proxy as BluetoothHeadsetClient
+                        ClientState.btStatus = "Ready to connect"
+                    }
+                }
+
+                override fun onServiceDisconnected(profile: Int) {
+                    if (profile == BluetoothProfile.HEADSET_CLIENT) {
+                        headsetClient = null
+                        ClientState.btStatus = "Disconnected"
+                    }
+                }
+            }
+            
+            ba.getProfileProxy(c, profileListener!!, BluetoothProfile.HEADSET_CLIENT)
+            ClientState.btStatus = "Initializing..."
+        } catch (e: Exception) {
+            ClientState.btStatus = "Error: ${e.message}"
+        }
+    }
+
+    fun connect() {
+        try {
+            val dev = a07Device ?: run { ClientState.btStatus = "No A07 MAC set"; return }
+            val hc = headsetClient ?: run { ClientState.btStatus = "Headset client not ready"; return }
+            
+            if (dev.bondState != BluetoothDevice.BOND_BONDED) {
+                ClientState.btStatus = "Bonding with A07..."
+                dev.createBond()
+            }
+            
+            hc.connect(dev)
+            ClientState.btStatus = "Connecting..."
+        } catch (e: SecurityException) {
+            ClientState.btStatus = "Permission denied"
+        } catch (e: Exception) {
+            ClientState.btStatus = "Error: ${e.message}"
+        }
+    }
+
+    fun disconnect() {
+        try {
+            val dev = a07Device ?: return
+            val hc = headsetClient ?: return
+            hc.disconnect(dev)
+            ClientState.btStatus = "Disconnected"
+        } catch (e: Exception) {
+            ClientState.btStatus = "Error: ${e.message}"
+        }
+    }
+
+    fun isConnected(): Boolean = headsetClient?.getConnectionState(a07Device) == BluetoothProfile.STATE_CONNECTED
 }
 
 class ClientService : Service() {
@@ -405,318 +476,4 @@ class ClientService : Service() {
             val nm = getSystemService(NotificationManager::class.java)
             nm.cancel(2)
             nm.cancel(3)
-            try { Thread.sleep(3000) } catch (_: Exception) {}
-        }
-    }
-
-    private fun handle(j: JSONObject) {
-        val nm = getSystemService(NotificationManager::class.java)
-        when (j.optString("ev")) {
-            "hello" -> ClientState.status = "Connected"
-            "denied" -> ClientState.status = "Wrong PIN"
-            "error" -> ClientState.status = j.optString("msg")
-            "call" -> {
-                val st = j.optString("state")
-                val num = j.optString("number")
-                val nameStr = j.optString("name")
-                ClientState.call = st
-                ClientState.number = num
-                ClientState.name = nameStr
-                val label = if (nameStr.isNotEmpty()) nameStr else if (num.isNotEmpty()) num else "Unknown number"
-                when (st) {
-                    "ringing" -> {
-                        nm.cancel(3)
-                        val n = nb(this, "ring")
-                            .setContentTitle("Incoming call")
-                            .setContentText(label)
-                            .setCategory(Notification.CATEGORY_CALL)
-                            .setOngoing(true)
-                            .setOnlyAlertOnce(true)
-                            .setFullScreenIntent(openApp(this), true)
-                            .addAction(actionOf(this, "Answer", "answer"))
-                            .addAction(actionOf(this, "Reject", "reject"))
-                            .build()
-                        n.flags = n.flags or Notification.FLAG_INSISTENT
-                        nm.notify(2, n)
-                    }
-                    "active" -> {
-                        nm.cancel(2)
-                        nm.notify(
-                            3,
-                            nb(this, "status")
-                                .setContentTitle("On a call")
-                                .setContentText("$label (voice is on the SIM phone)")
-                                .setOngoing(true)
-                                .setContentIntent(openApp(this))
-                                .addAction(actionOf(this, "Hang up", "hangup"))
-                                .build()
-                        )
-                    }
-                    else -> {
-                        nm.cancel(2)
-                        nm.cancel(3)
-                    }
-                }
-            }
-            "sms" -> {
-                val from = j.optString("name").ifEmpty { j.optString("from") }
-                val body = j.optString("body")
-                ClientState.sms.add(0, "$from: $body")
-                while (ClientState.sms.size > 30) ClientState.sms.removeAt(ClientState.sms.size - 1)
-                nm.notify(
-                    (System.currentTimeMillis() % 100000).toInt() + 100,
-                    nb(this, "sms")
-                        .setContentTitle(from)
-                        .setContentText(body)
-                        .setStyle(Notification.BigTextStyle().bigText(body))
-                        .setAutoCancel(true)
-                        .setContentIntent(openApp(this))
-                        .build()
-                )
-            }
-        }
-    }
-
-    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
-        instance = this
-        ensureChannels(this)
-        startFg(
-            this,
-            nb(this, "status")
-                .setContentTitle("SIM bridge remote")
-                .setContentText("Linked to your SIM phone")
-                .setOngoing(true)
-                .setContentIntent(openApp(this))
-                .build()
-        )
-        if (wl == null) {
-            wl = (getSystemService(Context.POWER_SERVICE) as PowerManager)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "simbridge:client")
-            wl?.acquire()
-        }
-        if (!running) {
-            running = true
-            Thread { connectLoop() }.start()
-        }
-        return START_STICKY
-    }
-
-    override fun onDestroy() {
-        running = false
-        instance = null
-        try { sock?.close() } catch (_: Exception) {}
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.cancel(2)
-        nm.cancel(3)
-        try { wl?.release() } catch (_: Exception) {}
-        wl = null
-        ClientState.status = "Stopped"
-        super.onDestroy()
-    }
-
-    override fun onBind(i: Intent?): IBinder? = null
-}
-
-class ActionReceiver : BroadcastReceiver() {
-    override fun onReceive(c: Context, i: Intent) {
-        val a = i.action ?: return
-        ClientService.send(JSONObject().put("cmd", a))
-    }
-}
-
-// ───────────────────────── SCREEN ─────────────────────────
-
-class MainActivity : Activity() {
-    private val h = Handler(Looper.getMainLooper())
-    private lateinit var root: LinearLayout
-    private var refresh: () -> Unit = {}
-
-    override fun onCreate(b: Bundle?) {
-        super.onCreate(b)
-        setShowWhenLocked(true)
-        setTurnScreenOn(true)
-        ensureChannels(this)
-        val sv = ScrollView(this)
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 60, 40, 60)
-        }
-        sv.addView(root)
-        setContentView(sv)
-        rebuild()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        tick()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        h.removeCallbacksAndMessages(null)
-    }
-
-    private fun tick() {
-        refresh()
-        h.postDelayed({ tick() }, 1000)
-    }
-
-    private fun tv(t: String, size: Float = 16f): TextView = TextView(this).apply {
-        text = t
-        textSize = size
-        setPadding(0, 12, 0, 12)
-    }
-
-    private fun btn(t: String, f: () -> Unit): Button = Button(this).apply {
-        text = t
-        setOnClickListener { f() }
-    }
-
-    private fun et(hint: String, v: String = ""): EditText = EditText(this).apply {
-        this.hint = hint
-        setText(v)
-    }
-
-    private fun rebuild() {
-        root.removeAllViews()
-        refresh = {}
-        when (prefs(this).getString("role", "")) {
-            "host" -> hostUi()
-            "client" -> clientUi()
-            else -> chooser()
-        }
-    }
-
-    private fun chooser() {
-        root.addView(tv("SIM Bridge", 26f))
-        root.addView(tv("Which phone is this?"))
-        root.addView(btn("This phone has the SIM (A07)") {
-            prefs(this).edit().putString("role", "host").apply()
-            rebuild()
-        })
-        root.addView(btn("This is the remote phone (S24)") {
-            prefs(this).edit().putString("role", "client").apply()
-            rebuild()
-        })
-    }
-
-    private fun changeRole() {
-        stopService(Intent(this, HostService::class.java))
-        stopService(Intent(this, ClientService::class.java))
-        prefs(this).edit().remove("role").apply()
-        rebuild()
-    }
-
-    private fun askPerms() {
-        val list = mutableListOf(
-            Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.READ_CALL_LOG,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.READ_CONTACTS,
-            Manifest.permission.RECEIVE_SMS,
-            Manifest.permission.SEND_SMS
-        )
-        if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
-        requestPermissions(list.toTypedArray(), 1)
-    }
-
-    @Suppress("BatteryLife")
-    private fun askBattery() {
-        startActivity(
-            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
-        )
-    }
-
-    private fun hostUi() {
-        val p = prefs(this)
-        if (p.getString("pin", "").isNullOrEmpty()) {
-            p.edit().putString("pin", (100000 + java.util.Random().nextInt(900000)).toString()).apply()
-        }
-        root.addView(tv("SIM phone mode", 24f))
-        root.addView(tv("PIN (enter this on the other phone):"))
-        root.addView(tv(p.getString("pin", "") ?: "", 32f))
-        val info = tv("")
-        root.addView(info)
-        root.addView(btn("1. Grant permissions") { askPerms() })
-        root.addView(btn("2. Allow background running") { askBattery() })
-        root.addView(btn("3. Start bridge") {
-            startForegroundService(Intent(this, HostService::class.java))
-        })
-        root.addView(btn("Stop bridge") { stopService(Intent(this, HostService::class.java)) })
-        root.addView(btn("Change role") { changeRole() })
-        refresh = {
-            info.text = "Bridge: " + (if (HostService.instance != null) "RUNNING" else "stopped") +
-                "\n\nThis phone's addresses:\n" + localIps().joinToString("\n")
-        }
-    }
-
-    private fun clientUi() {
-        val p = prefs(this)
-        root.addView(tv("Remote phone mode", 24f))
-        val ip = et("SIM phone IP (empty = auto on hotspot)", p.getString("hostIp", "") ?: "")
-        val pin = et("PIN from SIM phone", p.getString("pin", "") ?: "")
-        pin.inputType = InputType.TYPE_CLASS_NUMBER
-        root.addView(ip)
-        root.addView(pin)
-        root.addView(btn("Connect") {
-            p.edit().putString("hostIp", ip.text.toString().trim())
-                .putString("pin", pin.text.toString().trim()).apply()
-            if (Build.VERSION.SDK_INT >= 33) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
-            }
-            stopService(Intent(this, ClientService::class.java))
-            startForegroundService(Intent(this, ClientService::class.java))
-        })
-        root.addView(btn("Allow background running") { askBattery() })
-        root.addView(btn("Disconnect") { stopService(Intent(this, ClientService::class.java)) })
-
-        val status = tv("")
-        val callInfo = tv("", 20f)
-        root.addView(status)
-        root.addView(callInfo)
-        root.addView(btn("Answer") { ClientService.send(JSONObject().put("cmd", "answer")) })
-        root.addView(btn("Reject / Hang up") { ClientService.send(JSONObject().put("cmd", "hangup")) })
-
-        root.addView(tv("Dial from the SIM", 18f))
-        val num = et("Phone number")
-        num.inputType = InputType.TYPE_CLASS_PHONE
-        root.addView(num)
-        root.addView(btn("Call") {
-            ClientService.send(JSONObject().put("cmd", "dial").put("number", num.text.toString()))
-        })
-
-        root.addView(tv("Send a text", 18f))
-        val to = et("To number")
-        to.inputType = InputType.TYPE_CLASS_PHONE
-        val body = et("Message")
-        root.addView(to)
-        root.addView(body)
-        root.addView(btn("Send SMS") {
-            val t = to.text.toString().trim()
-            val m = body.text.toString()
-            if (t.isNotEmpty() && m.isNotEmpty()) {
-                ClientService.send(JSONObject().put("cmd", "sms").put("to", t).put("body", m))
-                ClientState.sms.add(0, "Me -> $t: $m")
-                body.setText("")
-            }
-        })
-
-        root.addView(tv("Received texts", 18f))
-        val smsView = tv("")
-        root.addView(smsView)
-        root.addView(btn("Change role") { changeRole() })
-
-        refresh = {
-            status.text = "Status: " + ClientState.status
-            val who = if (ClientState.name.isNotEmpty()) "${ClientState.name} (${ClientState.number})"
-            else ClientState.number.ifEmpty { "unknown number" }
-            callInfo.text = when (ClientState.call) {
-                "ringing" -> "Incoming call: $who"
-                "active" -> "On a call: $who\n(voice is on the SIM phone - use its earbuds)"
-                else -> "No active call"
-            }
-            smsView.text = ClientState.sms.joinToString("\n\n")
-        }
-    }
-}
+            try {
