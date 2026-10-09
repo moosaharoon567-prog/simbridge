@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.simbridge"
-    compileSdk = 35
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.simbridge"
-        minSdk = 31
-        targetSdk = 35
+        minSdk = 28
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
     }
