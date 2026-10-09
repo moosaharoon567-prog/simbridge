@@ -14,10 +14,13 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.RingtoneManager
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -54,15 +57,14 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const val PORT_CTRL  = 8765   // TCP control channel
-const val PORT_AUDIO_A2S = 8766 // UDP  A07 mic  → S24 speaker
-const val PORT_AUDIO_S2A = 8767 // UDP  S24 mic  → A07 speaker
-
-const val SAMPLE_RATE  = 16000
-const val CHANNEL_IN   = AudioFormat.CHANNEL_IN_MONO
-const val CHANNEL_OUT  = AudioFormat.CHANNEL_OUT_MONO
-const val ENCODING     = AudioFormat.ENCODING_PCM_16BIT
+const val PORT_CTRL      = 8765
+const val PORT_AUDIO_A2S = 8766
+const val PORT_AUDIO_S2A = 8767
+const val SAMPLE_RATE    = 16000
+const val CHANNEL_IN     = AudioFormat.CHANNEL_IN_MONO
+const val CHANNEL_OUT    = AudioFormat.CHANNEL_OUT_MONO
+const val ENCODING       = AudioFormat.ENCODING_PCM_16BIT
+const val REQ_PROJECTION = 9001
 
 fun prefs(c: Context) = c.getSharedPreferences("bridge", Context.MODE_PRIVATE)
 
@@ -72,21 +74,18 @@ fun localIps(): List<String> = try {
             .filter { it is Inet4Address && !it.isLoopbackAddress }
             .map { "${it.hostAddress}  (${ni.name})" }
     }
-} catch (e: Exception) { emptyList() }
+} catch (_: Exception) { emptyList() }
 
 fun ensureChannels(c: Context) {
     val nm = c.getSystemService(NotificationManager::class.java) ?: return
-    nm.createNotificationChannel(
-        NotificationChannel("status", "Bridge status", NotificationManager.IMPORTANCE_LOW))
-    val ring = NotificationChannel("ring", "Incoming calls", NotificationManager.IMPORTANCE_HIGH)
+    nm.createNotificationChannel(NotificationChannel("status","Bridge status",NotificationManager.IMPORTANCE_LOW))
+    val ring = NotificationChannel("ring","Incoming calls",NotificationManager.IMPORTANCE_HIGH)
     ring.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
-        AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+        AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
     ring.enableVibration(true)
     nm.createNotificationChannel(ring)
-    nm.createNotificationChannel(
-        NotificationChannel("sms", "Messages", NotificationManager.IMPORTANCE_HIGH))
+    nm.createNotificationChannel(NotificationChannel("sms","Messages",NotificationManager.IMPORTANCE_HIGH))
 }
 
 fun nb(c: Context, ch: String): Notification.Builder =
@@ -105,53 +104,76 @@ fun actionOf(c: Context, label: String, act: String): Notification.Action {
 fun startFg(s: Service, n: Notification) {
     if (Build.VERSION.SDK_INT >= 34)
         s.startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-    else
-        s.startForeground(1, n)
+    else s.startForeground(1, n)
 }
 
-// ── Audio relay (runs on A07 when a call is active) ──────────────────────────
-// A07 → S24: capture mic → send UDP packets to S24
-// S24 → A07: receive UDP packets → play to speaker (caller hears S24 user)
+// ── MediaProjection holder (A07 side) ────────────────────────────────────────
+// We need a MediaProjection to use AudioPlaybackCapture.
+// MainActivity requests it once and stores it here.
+object ProjectionHolder {
+    @Volatile var projection: MediaProjection? = null
+    @Volatile var pendingIp: String? = null
+    @Volatile var pendingCtx: Context? = null
 
+    fun tryStart() {
+        val ip  = pendingIp  ?: return
+        val ctx = pendingCtx ?: return
+        val mp  = projection ?: return
+        AudioRelay.startWithProjection(ctx, ip, mp)
+        pendingIp  = null
+        pendingCtx = null
+    }
+}
+
+// ── Audio relay A07 → S24 ────────────────────────────────────────────────────
 object AudioRelay {
-    @Volatile var running = false
-    @Volatile var remoteIp: String? = null   // set by HostService when S24 connects
+    @Volatile var running   = false
+    @Volatile var remoteIp: String? = null
 
     private var txThread: Thread? = null
     private var rxThread: Thread? = null
-    private var rxSock: DatagramSocket? = null
+    private var rxSock:   DatagramSocket? = null
 
-    fun start(ctx: Context, ip: String) {
+    // Called when we have a MediaProjection available
+    fun startWithProjection(ctx: Context, ip: String, mp: MediaProjection) {
         if (running) return
         remoteIp = ip
-        running = true
+        running  = true
 
         val am = ctx.getSystemService(AudioManager::class.java)
 
-        // TX: record from mic (VOICE_COMMUNICATION = AEC + noise suppression)
+        // TX: capture call playback audio via AudioPlaybackCapture (no speakerphone needed)
         txThread = Thread {
             val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
-            val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                SAMPLE_RATE, CHANNEL_IN, ENCODING, bufSize * 4)
+            val config  = AudioPlaybackCaptureConfiguration.Builder(mp)
+                .addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .build()
+            val rec = AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(config)
+                .setAudioFormat(AudioFormat.Builder()
+                    .setEncoding(ENCODING)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(CHANNEL_IN).build())
+                .setBufferSizeInBytes(bufSize * 4)
+                .build()
             val sock = DatagramSocket()
-            val buf = ByteArray(bufSize)
+            val buf  = ByteArray(bufSize)
             try {
                 rec.startRecording()
                 while (running) {
                     val n = rec.read(buf, 0, buf.size)
                     if (n > 0) {
-                        val pkt = DatagramPacket(buf, n,
-                            java.net.InetAddress.getByName(ip), PORT_AUDIO_A2S)
-                        sock.send(pkt)
+                        sock.send(DatagramPacket(buf, n,
+                            java.net.InetAddress.getByName(ip), PORT_AUDIO_A2S))
                     }
                 }
             } catch (_: Exception) {
-            } finally {
-                rec.stop(); rec.release(); sock.close()
-            }
+            } finally { rec.stop(); rec.release(); sock.close() }
         }.also { it.start() }
 
-        // RX: receive from S24, play to speaker so caller hears S24 user's voice
+        // RX: S24 mic → play to A07 so caller hears S24 user
         rxThread = Thread {
             val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
             val track = AudioTrack.Builder()
@@ -167,7 +189,6 @@ object AudioRelay {
             rxSock = sock
             val buf = ByteArray(bufSize)
             try {
-                // Route audio to earpiece / speakerphone
                 am?.mode = AudioManager.MODE_IN_COMMUNICATION
                 track.play()
                 while (running) {
@@ -183,6 +204,71 @@ object AudioRelay {
         }.also { it.start() }
     }
 
+    // Fallback: start without projection using plain mic capture
+    fun startFallback(ctx: Context, ip: String) {
+        if (running) return
+        remoteIp = ip
+        running  = true
+        val am = ctx.getSystemService(AudioManager::class.java)
+
+        txThread = Thread {
+            val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
+            val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                SAMPLE_RATE, CHANNEL_IN, ENCODING, bufSize * 4)
+            val sock = DatagramSocket()
+            val buf  = ByteArray(bufSize)
+            try {
+                rec.startRecording()
+                while (running) {
+                    val n = rec.read(buf, 0, buf.size)
+                    if (n > 0) sock.send(DatagramPacket(buf, n,
+                        java.net.InetAddress.getByName(ip), PORT_AUDIO_A2S))
+                }
+            } catch (_: Exception) {
+            } finally { rec.stop(); rec.release(); sock.close() }
+        }.also { it.start() }
+
+        rxThread = Thread {
+            val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setAudioFormat(AudioFormat.Builder()
+                    .setEncoding(ENCODING).setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(CHANNEL_OUT).build())
+                .setBufferSizeInBytes(bufSize * 4)
+                .setTransferMode(AudioTrack.MODE_STREAM).build()
+            val sock = DatagramSocket(PORT_AUDIO_S2A)
+            rxSock = sock
+            val buf = ByteArray(bufSize)
+            try {
+                am?.mode = AudioManager.MODE_IN_COMMUNICATION
+                track.play()
+                while (running) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    sock.receive(pkt)
+                    track.write(pkt.data, 0, pkt.length)
+                }
+            } catch (_: Exception) {
+            } finally {
+                track.stop(); track.release(); sock.close()
+                am?.mode = AudioManager.MODE_NORMAL
+            }
+        }.also { it.start() }
+    }
+
+    fun start(ctx: Context, ip: String) {
+        val mp = ProjectionHolder.projection
+        if (mp != null) startWithProjection(ctx, ip, mp)
+        else {
+            // store for when projection arrives, or fall back
+            ProjectionHolder.pendingIp  = ip
+            ProjectionHolder.pendingCtx = ctx
+            startFallback(ctx, ip)
+        }
+    }
+
     fun stop() {
         running = false
         try { rxSock?.close() } catch (_: Exception) {}
@@ -191,19 +277,17 @@ object AudioRelay {
     }
 }
 
-// Audio relay client side (S24)
+// ── Audio relay client (S24) ─────────────────────────────────────────────────
 object AudioRelayClient {
     @Volatile var running = false
-
     private var txThread: Thread? = null
     private var rxThread: Thread? = null
-    private var rxSock: DatagramSocket? = null
+    private var rxSock:   DatagramSocket? = null
 
     fun start(ctx: Context, hostIp: String) {
         if (running) return
         running = true
 
-        // RX: receive A07 mic (caller voice) → play to S24 earpiece
         rxThread = Thread {
             val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
             val track = AudioTrack.Builder()
@@ -216,10 +300,9 @@ object AudioRelayClient {
                 .setBufferSizeInBytes(bufSize * 4)
                 .setTransferMode(AudioTrack.MODE_STREAM).build()
             val sock = DatagramSocket(PORT_AUDIO_A2S)
-            rxSock = sock
-            sock.soTimeout = 2000
+            rxSock = sock; sock.soTimeout = 2000
             val buf = ByteArray(bufSize)
-            val am = ctx.getSystemService(AudioManager::class.java)
+            val am  = ctx.getSystemService(AudioManager::class.java)
             try {
                 am?.mode = AudioManager.MODE_IN_COMMUNICATION
                 track.play()
@@ -237,27 +320,21 @@ object AudioRelayClient {
             }
         }.also { it.start() }
 
-        // TX: record S24 mic → send to A07 (so caller hears S24 user)
         txThread = Thread {
             val bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
-            val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            val rec  = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 SAMPLE_RATE, CHANNEL_IN, ENCODING, bufSize * 4)
             val sock = DatagramSocket()
-            val buf = ByteArray(bufSize)
+            val buf  = ByteArray(bufSize)
             try {
                 rec.startRecording()
                 while (running) {
                     val n = rec.read(buf, 0, buf.size)
-                    if (n > 0) {
-                        val pkt = DatagramPacket(buf, n,
-                            java.net.InetAddress.getByName(hostIp), PORT_AUDIO_S2A)
-                        sock.send(pkt)
-                    }
+                    if (n > 0) sock.send(DatagramPacket(buf, n,
+                        java.net.InetAddress.getByName(hostIp), PORT_AUDIO_S2A))
                 }
             } catch (_: Exception) {
-            } finally {
-                rec.stop(); rec.release(); sock.close()
-            }
+            } finally { rec.stop(); rec.release(); sock.close() }
         }.also { it.start() }
     }
 
@@ -270,7 +347,6 @@ object AudioRelayClient {
 }
 
 // ── SIM PHONE SIDE (A07) ─────────────────────────────────────────────────────
-
 class HostService : Service() {
     companion object { @Volatile var instance: HostService? = null }
 
@@ -278,10 +354,8 @@ class HostService : Service() {
     private val clients = CopyOnWriteArrayList<HClient>()
     private val io = Executors.newSingleThreadExecutor()
     private var wl: PowerManager.WakeLock? = null
-    private var pin = ""
-    private var state = "idle"
-    private var number = ""
-    private var name = ""
+    private var pin = ""; private var state = "idle"
+    private var number = ""; private var name = ""
 
     inner class HClient(val sock: Socket) {
         private val w = BufferedWriter(OutputStreamWriter(sock.getOutputStream()))
@@ -296,7 +370,6 @@ class HostService : Service() {
         fun close() {
             try { sock.close() } catch (_: Exception) {}
             clients.remove(this)
-            // stop audio relay if this was the audio client
             if (AudioRelay.remoteIp == remoteIp) AudioRelay.stop()
         }
 
@@ -308,12 +381,10 @@ class HostService : Service() {
                     val line = r.readLine() ?: break
                     try { handle(JSONObject(line)) }
                     catch (e: SecurityException) {
-                        send(JSONObject().put("ev","error").put("msg","Permission missing on SIM phone"))
-                    }
+                        send(JSONObject().put("ev","error").put("msg","Permission missing")) }
                     catch (_: Exception) {}
                 }
-            } catch (_: Exception) {
-            } finally { close() }
+            } catch (_: Exception) { } finally { close() }
         }
 
         private fun handle(j: JSONObject) {
@@ -328,24 +399,20 @@ class HostService : Service() {
             }
             val tm = getSystemService(TelecomManager::class.java) ?: return
             when (cmd) {
-                "ping"           -> send(JSONObject().put("ev","pong"))
-                "answer"         -> tm.acceptRingingCall()
-                "reject","hangup"-> tm.endCall()
-                "audio_start"    -> {
-                    // S24 is ready to relay audio — start AudioRelay toward S24
-                    AudioRelay.start(this@HostService, remoteIp)
-                }
-                "audio_stop"     -> AudioRelay.stop()
-                "dial"           -> {
+                "ping"            -> send(JSONObject().put("ev","pong"))
+                "answer"          -> tm.acceptRingingCall()
+                "reject","hangup" -> tm.endCall()
+                "audio_start"     -> AudioRelay.start(this@HostService, remoteIp)
+                "audio_stop"      -> AudioRelay.stop()
+                "dial"            -> {
                     val n = j.optString("number").filter { it.isDigit()||it=='+'||it=='*'||it=='#' }
                     if (n.isNotEmpty()) {
                         io.execute { number = n; name = lookupName(n) }
-                        tm.placeCall(Uri.fromParts("tel", n, null), Bundle())
+                        tm.placeCall(Uri.fromParts("tel",n,null), Bundle())
                     }
                 }
-                "sms"            -> {
-                    val to   = j.optString("to")
-                    val body = j.optString("body")
+                "sms" -> {
+                    val to = j.optString("to"); val body = j.optString("body")
                     if (to.isNotEmpty() && body.isNotEmpty()) {
                         val sm = smsMgr()
                         sm.sendMultipartTextMessage(to, null, sm.divideMessage(body), null, null)
@@ -368,21 +435,20 @@ class HostService : Service() {
     private fun lookupName(n: String): String = try {
         val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(n))
         contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME),
-            null, null, null)?.use { if (it.moveToFirst()) it.getString(0) ?: "" else "" } ?: ""
+            null,null,null)?.use { if (it.moveToFirst()) it.getString(0) ?: "" else "" } ?: ""
     } catch (_: Exception) { "" }
 
     fun onPhoneState(st: String?, num: String?) {
         io.execute {
-            val s = when (st) {
-                TelephonyManager.EXTRA_STATE_RINGING  -> "ringing"
-                TelephonyManager.EXTRA_STATE_OFFHOOK  -> "active"
+            val s = when(st) {
+                TelephonyManager.EXTRA_STATE_RINGING -> "ringing"
+                TelephonyManager.EXTRA_STATE_OFFHOOK -> "active"
                 else -> "idle"
             }
             var changed = s != state
             if (s == "idle") {
-                if (number.isNotEmpty() || name.isNotEmpty()) changed = true
-                number = ""; name = ""
-                AudioRelay.stop()
+                if (number.isNotEmpty()||name.isNotEmpty()) changed = true
+                number = ""; name = ""; AudioRelay.stop()
             } else if (!num.isNullOrEmpty() && num != number) {
                 number = num; name = lookupName(num); changed = true
             }
@@ -425,14 +491,11 @@ class HostService : Service() {
     }
 
     override fun onDestroy() {
-        instance = null
-        AudioRelay.stop()
+        instance = null; AudioRelay.stop()
         try { server?.close() } catch (_: Exception) {}
-        server = null
-        clients.forEach { it.close() }
+        server = null; clients.forEach { it.close() }
         try { wl?.release() } catch (_: Exception) {}
-        wl = null; io.shutdown()
-        super.onDestroy()
+        wl = null; io.shutdown(); super.onDestroy()
     }
 
     override fun onBind(i: Intent?): IBinder? = null
@@ -457,7 +520,6 @@ class SmsReceiver : BroadcastReceiver() {
 }
 
 // ── REMOTE PHONE SIDE (S24) ──────────────────────────────────────────────────
-
 object ClientState {
     @Volatile var status  = "Not started"
     @Volatile var call    = "idle"
@@ -498,8 +560,8 @@ class ClientService : Service() {
 
     private fun connectLoop() {
         while (running) {
-            val p    = prefs(this)
-            val pin  = p.getString("pin","") ?: ""
+            val p     = prefs(this)
+            val pin   = p.getString("pin","") ?: ""
             val saved = p.getString("hostIp","")?.trim().orEmpty()
             val candidates = listOfNotNull(saved.ifEmpty { null }, gateway()).distinct()
             if (candidates.isEmpty()) ClientState.status = "No Wi-Fi / IP to try"
@@ -510,14 +572,14 @@ class ClientService : Service() {
                     val s = Socket(); s.connect(InetSocketAddress(ip, PORT_CTRL), 4000)
                     s.soTimeout = 10000; sock = s; hostIp = ip
                     writer = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
-                    val r = BufferedReader(InputStreamReader(s.getInputStream()))
+                    val r  = BufferedReader(InputStreamReader(s.getInputStream()))
                     send(JSONObject().put("cmd","hello").put("pin",pin))
                     var lastRx = System.currentTimeMillis()
                     while (running) {
                         var line: String? = null
                         try { line = r.readLine() }
                         catch (_: SocketTimeoutException) {
-                            if (System.currentTimeMillis() - lastRx > 40000) break
+                            if (System.currentTimeMillis()-lastRx > 40000) break
                             send(JSONObject().put("cmd","ping")); continue
                         }
                         if (line == null) break
@@ -526,9 +588,7 @@ class ClientService : Service() {
                     }
                 } catch (_: Exception) {
                 } finally {
-                    writer = null
-                    AudioRelayClient.stop()
-                    ClientState.audioOn = false
+                    writer = null; AudioRelayClient.stop(); ClientState.audioOn = false
                     try { sock?.close() } catch (_: Exception) {}
                 }
             }
@@ -550,44 +610,36 @@ class ClientService : Service() {
                 val st      = j.optString("state")
                 val num     = j.optString("number")
                 val nameStr = j.optString("name")
-                ClientState.call   = st
-                ClientState.number = num
-                ClientState.name   = nameStr
+                ClientState.call = st; ClientState.number = num; ClientState.name = nameStr
                 val label = nameStr.ifEmpty { num.ifEmpty { "Unknown" } }
                 when (st) {
                     "ringing" -> {
                         nm.cancel(3)
                         val n = nb(this,"ring")
-                            .setContentTitle("Incoming call")
-                            .setContentText(label)
+                            .setContentTitle("Incoming call").setContentText(label)
                             .setCategory(Notification.CATEGORY_CALL)
                             .setOngoing(true).setOnlyAlertOnce(true)
                             .setFullScreenIntent(openApp(this), true)
                             .addAction(actionOf(this,"Answer","answer"))
-                            .addAction(actionOf(this,"Reject","reject"))
-                            .build()
+                            .addAction(actionOf(this,"Reject","reject")).build()
                         n.flags = n.flags or Notification.FLAG_INSISTENT
                         nm.notify(2, n)
                     }
                     "active" -> {
                         nm.cancel(2)
-                        // start audio relay automatically
                         if (!AudioRelayClient.running) {
                             AudioRelayClient.start(this, hostIp)
                             ClientState.audioOn = true
                             send(JSONObject().put("cmd","audio_start"))
                         }
                         nm.notify(3, nb(this,"status")
-                            .setContentTitle("On a call — audio on S24")
-                            .setContentText(label)
+                            .setContentTitle("On a call — audio on S24").setContentText(label)
                             .setOngoing(true).setContentIntent(openApp(this))
-                            .addAction(actionOf(this,"Hang up","hangup"))
-                            .build())
+                            .addAction(actionOf(this,"Hang up","hangup")).build())
                     }
                     else -> {
                         nm.cancel(2); nm.cancel(3)
-                        AudioRelayClient.stop()
-                        ClientState.audioOn = false
+                        AudioRelayClient.stop(); ClientState.audioOn = false
                         send(JSONObject().put("cmd","audio_stop"))
                     }
                 }
@@ -595,9 +647,9 @@ class ClientService : Service() {
             "sms" -> {
                 val from = j.optString("name").ifEmpty { j.optString("from") }
                 val body = j.optString("body")
-                ClientState.sms.add(0, "$from: $body")
-                while (ClientState.sms.size > 30) ClientState.sms.removeAt(ClientState.sms.size - 1)
-                nm.notify((System.currentTimeMillis() % 100000).toInt() + 100,
+                ClientState.sms.add(0,"$from: $body")
+                while (ClientState.sms.size > 30) ClientState.sms.removeAt(ClientState.sms.size-1)
+                nm.notify((System.currentTimeMillis()%100000).toInt()+100,
                     nb(this,"sms").setContentTitle(from).setContentText(body)
                         .setStyle(Notification.BigTextStyle().bigText(body))
                         .setAutoCancel(true).setContentIntent(openApp(this)).build())
@@ -608,8 +660,7 @@ class ClientService : Service() {
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
         instance = this; ensureChannels(this)
         startFg(this, nb(this,"status")
-            .setContentTitle("SIM bridge remote")
-            .setContentText("Linked to your SIM phone")
+            .setContentTitle("SIM bridge remote").setContentText("Linked to your SIM phone")
             .setOngoing(true).setContentIntent(openApp(this)).build())
         if (wl == null) {
             wl = (getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -627,8 +678,7 @@ class ClientService : Service() {
         val nm = getSystemService(NotificationManager::class.java)!!
         nm.cancel(2); nm.cancel(3)
         try { wl?.release() } catch (_: Exception) {}
-        wl = null; ClientState.status = "Stopped"
-        super.onDestroy()
+        wl = null; ClientState.status = "Stopped"; super.onDestroy()
     }
 
     override fun onBind(i: Intent?): IBinder? = null
@@ -642,7 +692,6 @@ class ActionReceiver : BroadcastReceiver() {
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────
-
 class MainActivity : Activity() {
     private val h = Handler(Looper.getMainLooper())
     private lateinit var root: LinearLayout
@@ -653,22 +702,29 @@ class MainActivity : Activity() {
         setShowWhenLocked(true); setTurnScreenOn(true)
         ensureChannels(this)
         val sv = ScrollView(this)
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(40,60,40,60) }
+        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40,60,40,60) }
         sv.addView(root); setContentView(sv); rebuild()
     }
 
-    override fun onResume()  { super.onResume();  tick() }
-    override fun onPause()   { super.onPause();   h.removeCallbacksAndMessages(null) }
+    override fun onResume() { super.onResume(); tick() }
+    override fun onPause()  { super.onPause();  h.removeCallbacksAndMessages(null) }
+
+    // Handle MediaProjection result (A07 side)
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        if (req == REQ_PROJECTION && res == RESULT_OK && data != null) {
+            val mpm = getSystemService(MediaProjectionManager::class.java)
+            ProjectionHolder.projection = mpm.getMediaProjection(res, data)
+            ProjectionHolder.tryStart()
+        }
+    }
 
     private fun tick() { refresh(); h.postDelayed({ tick() }, 1000) }
 
     private fun tv(t: String, size: Float = 16f) = TextView(this).apply {
         text = t; textSize = size; setPadding(0,12,0,12) }
-
     private fun btn(t: String, f: () -> Unit) = Button(this).apply {
         text = t; setOnClickListener { f() } }
-
     private fun et(hint: String, v: String = "") = EditText(this).apply {
         this.hint = hint; setText(v) }
 
@@ -698,22 +754,22 @@ class MainActivity : Activity() {
 
     private fun askPerms() {
         val list = mutableListOf(
-            Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.READ_CALL_LOG,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.READ_CONTACTS,
-            Manifest.permission.RECEIVE_SMS,
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.RECORD_AUDIO)
+            Manifest.permission.READ_PHONE_STATE, Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_CONTACTS, Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.SEND_SMS, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
         requestPermissions(list.toTypedArray(), 1)
     }
 
     @Suppress("BatteryLife")
     private fun askBattery() = startActivity(
-        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-            Uri.parse("package:$packageName")))
+        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+
+    private fun requestProjection() {
+        val mpm = getSystemService(MediaProjectionManager::class.java)
+        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION)
+    }
 
     private fun hostUi() {
         val p = prefs(this)
@@ -724,15 +780,16 @@ class MainActivity : Activity() {
         root.addView(tv(p.getString("pin","") ?: "", 32f))
         val info = tv("")
         root.addView(info)
-        root.addView(btn("1. Grant permissions")    { askPerms() })
-        root.addView(btn("2. Allow background")     { askBattery() })
-        root.addView(btn("3. Start bridge")         {
+        root.addView(btn("1. Grant permissions")  { askPerms() })
+        root.addView(btn("2. Allow background")   { askBattery() })
+        root.addView(btn("3. Grant audio capture (one time)") { requestProjection() })
+        root.addView(btn("4. Start bridge") {
             startForegroundService(Intent(this, HostService::class.java)) })
-        root.addView(btn("Stop bridge")             {
-            stopService(Intent(this, HostService::class.java)) })
-        root.addView(btn("Change role")             { changeRole() })
+        root.addView(btn("Stop bridge") { stopService(Intent(this, HostService::class.java)) })
+        root.addView(btn("Change role") { changeRole() })
         refresh = {
             info.text = "Bridge: " + (if (HostService.instance != null) "RUNNING" else "stopped") +
+                "\nAudio capture: " + (if (ProjectionHolder.projection != null) "GRANTED" else "not granted") +
                 "\nAudio relay: " + (if (AudioRelay.running) "ACTIVE" else "idle") +
                 "\n\nAddresses:\n" + localIps().joinToString("\n")
         }
@@ -755,13 +812,13 @@ class MainActivity : Activity() {
             startForegroundService(Intent(this, ClientService::class.java))
         })
         root.addView(btn("Allow background") { askBattery() })
-        root.addView(btn("Disconnect")       { stopService(Intent(this, ClientService::class.java)) })
+        root.addView(btn("Disconnect") { stopService(Intent(this, ClientService::class.java)) })
 
         val status   = tv("")
         val callInfo = tv("", 20f)
         root.addView(status); root.addView(callInfo)
-        root.addView(btn("Answer")       { ClientService.send(JSONObject().put("cmd","answer")) })
-        root.addView(btn("Hang up")      { ClientService.send(JSONObject().put("cmd","hangup")) })
+        root.addView(btn("Answer")   { ClientService.send(JSONObject().put("cmd","answer")) })
+        root.addView(btn("Hang up")  { ClientService.send(JSONObject().put("cmd","hangup")) })
 
         root.addView(tv("Dial", 18f))
         val num = et("Number"); num.inputType = InputType.TYPE_CLASS_PHONE
